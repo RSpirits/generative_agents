@@ -14,7 +14,7 @@ from django.shortcuts import render, redirect, HttpResponseRedirect
 from django.http import HttpResponse, JsonResponse
 from global_methods import *
 
-from django.contrib.staticfiles.templatetags.staticfiles import static
+from django.templatetags.static import static
 from .models import *
 
 def landing(request): 
@@ -117,7 +117,8 @@ def home(request):
   with open(f_curr_step) as json_file:  
     step = json.load(json_file)["step"]
 
-  os.remove(f_curr_step)
+  # Keep curr_step.json so the page can be refreshed
+  # os.remove(f_curr_step)
 
   persona_names = []
   persona_names_set = set()
