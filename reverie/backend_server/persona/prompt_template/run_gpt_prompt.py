@@ -113,11 +113,18 @@ def run_gpt_prompt_daily_plan(persona,
   def __func_clean_up(gpt_response, prompt=""):
     cr = []
     _cr = gpt_response.split(")")
-    for i in _cr: 
-      if i[-1].isdigit(): 
+    for idx, i in enumerate(_cr):
+      i = i.strip()
+      if not i:
+        continue
+      # Remove trailing number (next item's index) if present
+      if i[-1].isdigit():
         i = i[:-1].strip()
-        if i[-1] == "." or i[-1] == ",": 
-          cr += [i[:-1].strip()]
+      # Remove trailing punctuation/connectors
+      while i and i[-1] in ".,;and ":
+        i = i.rstrip(".,;and ").strip()
+      if i:
+        cr.append(i)
     return cr
 
   def __func_validate(gpt_response, prompt=""):
@@ -370,13 +377,20 @@ def run_gpt_prompt_task_decomp(persona,
         _cr += [" ".join([j.strip () for j in i.split(" ")][3:])]
       else: 
         _cr += [i]
-    for count, i in enumerate(_cr): 
-      k = [j.strip() for j in i.split("(duration in minutes:")]
-      task = k[0]
-      if task[-1] == ".": 
-        task = task[:-1]
-      duration = int(k[1].split(",")[0].strip())
-      cr += [[task, duration]]
+    for count, i in enumerate(_cr):
+      try:
+        k = [j.strip() for j in i.split("(duration in minutes:")]
+        if len(k) < 2:
+          continue
+        task = k[0].strip()
+        if task and task[-1] == ".":
+          task = task[:-1]
+        if not task:
+          continue
+        duration = int(k[1].split(",")[0].strip())
+        cr += [[task, duration]]
+      except (ValueError, IndexError):
+        continue
 
     total_expected_min = int(prompt.split("(total duration in minutes")[-1]
                                    .split("):")[0].strip())
@@ -384,47 +398,74 @@ def run_gpt_prompt_task_decomp(persona,
     # TODO -- now, you need to make sure that this is the same as the sum of 
     #         the current action sequence. 
     curr_min_slot = [["dummy", -1],] # (task_name, task_index)
-    for count, i in enumerate(cr): 
-      i_task = i[0] 
+    for count, i in enumerate(cr):
+      i_task = i[0]
       i_duration = i[1]
 
       i_duration -= (i_duration % 5)
-      if i_duration > 0: 
-        for j in range(i_duration): 
-          curr_min_slot += [(i_task, count)]       
-    curr_min_slot = curr_min_slot[1:]   
+      if i_duration > 0:
+        for j in range(i_duration):
+          curr_min_slot += [(i_task, count)]
+    curr_min_slot = curr_min_slot[1:]
 
-    if len(curr_min_slot) > total_expected_min: 
+    # Fallback: LLM returned unparseable output (no "(duration in minutes:" lines).
+    # Instead of crashing on curr_min_slot[-1] below, synthesize a single-block
+    # decomposition that covers the full expected duration.
+    # NOTE: we intentionally avoid referencing the closure variable `task` here
+    # because the for-loop below (`for task, task_index in curr_min_slot`)
+    # reassigns `task`, making Python treat it as a local variable throughout
+    # this function — accessing it above that loop raises UnboundLocalError.
+    safe_total = total_expected_min if total_expected_min > 0 else 5
+    if len(curr_min_slot) == 0:
+      print("[task_decomp fallback] clean_up got empty slot; using generic block")
+      return [["continuing the activity", safe_total]]
+
+    if len(curr_min_slot) > total_expected_min and len(curr_min_slot) > 60:
       last_task = curr_min_slot[60]
-      for i in range(1, 6): 
+      for i in range(1, 6):
         curr_min_slot[-1 * i] = last_task
-    elif len(curr_min_slot) < total_expected_min: 
+    elif len(curr_min_slot) < total_expected_min:
       last_task = curr_min_slot[-1]
       for i in range(total_expected_min - len(curr_min_slot)):
         curr_min_slot += [last_task]
 
     cr_ret = [["dummy", -1],]
-    for task, task_index in curr_min_slot: 
-      if task != cr_ret[-1][0]: 
-        cr_ret += [[task, 1]]
-      else: 
+    for slot_task, task_index in curr_min_slot:
+      if slot_task != cr_ret[-1][0]:
+        cr_ret += [[slot_task, 1]]
+      else:
         cr_ret[-1][1] += 1
     cr = cr_ret[1:]
 
+    if not cr:
+      print("[task_decomp fallback] cr_ret empty after processing; using generic block")
+      return [["continuing the activity", safe_total]]
+
     return cr
 
-  def __func_validate(gpt_response, prompt=""): 
-    # TODO -- this sometimes generates error 
-    try: 
-      __func_clean_up(gpt_response)
-    except: 
-      pass
-      # return False
+  def __func_validate(gpt_response, prompt=""):
+    # Actually validate: if clean_up crashes or returns empty, treat as invalid
+    # so safe_generate_response retries (up to 5 times) instead of passing
+    # garbage downstream. Stanford's original `except: pass` caused
+    # IndexError crashes when the LLM returned unparseable output.
+    try:
+      result = __func_clean_up(gpt_response, prompt=prompt)
+    except Exception as e:
+      print(f"[task_decomp validate] clean_up raised {type(e).__name__}: {e}; "
+            f"marking response invalid for retry")
+      return False
+    if not result:
+      print(f"[task_decomp validate] clean_up returned empty; "
+            f"marking response invalid for retry")
+      return False
     return gpt_response
 
-  def get_fail_safe(): 
-    fs = ["asleep"]
-    return fs
+  def get_fail_safe():
+    # Must be structured as [[task, duration], ...] so downstream
+    # `for i_task, i_duration in output` unpacking survives. Stanford's
+    # original `["asleep"]` would crash at that loop.
+    total_min = max(int(duration), 5)
+    return [[task if task else "continuing the activity", total_min]]
 
   gpt_param = {"engine": "text-davinci-003", "max_tokens": 1000, 
              "temperature": 0, "top_p": 1, "stream": False,
@@ -457,21 +498,27 @@ def run_gpt_prompt_task_decomp(persona,
 
   fin_output = []
   time_sum = 0
-  for i_task, i_duration in output: 
+  for i_task, i_duration in output:
     time_sum += i_duration
     # HM?????????
-    # if time_sum < duration: 
-    if time_sum <= duration: 
+    # if time_sum < duration:
+    if time_sum <= duration:
       fin_output += [[i_task, i_duration]]
-    else: 
+    else:
       break
+  # Safety net: if all output entries exceeded `duration` in the first step
+  # (so the loop broke immediately), fin_output is empty. Stanford's own
+  # TODO comment above notes this as a historical crash site.
+  if not fin_output:
+    fallback_task = output[0][0] if output else (task if task else "continuing the activity")
+    fin_output = [[fallback_task, duration]]
   ftime_sum = 0
-  for fi_task, fi_duration in fin_output: 
+  for fi_task, fi_duration in fin_output:
     ftime_sum += fi_duration
-  
+
   # print ("for debugging... line 365", fin_output)
   fin_output[-1][1] += (duration - ftime_sum)
-  output = fin_output 
+  output = fin_output
 
 
 
@@ -840,6 +887,9 @@ def run_gpt_prompt_pronunciatio(action_description, persona, verbose=False):
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
 
+  output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
+
 
 
 
@@ -883,57 +933,26 @@ def run_gpt_prompt_event_triple(action_description, persona, verbose=False):
     return prompt_input
   
   def __func_clean_up(gpt_response, prompt=""):
-    cr = gpt_response.strip()
-    cr = [i.strip() for i in cr.split(")")[0].split(",")]
-    return cr
+    cr = gpt_response.strip().lstrip('"').lstrip("'")
+    cr = [i.strip().strip('"').strip("'")
+          for i in cr.split(")")[0].split(",") if i.strip()]
+    # Take first two elements (verb, object) even if model returned more
+    return cr[:2]
 
-  def __func_validate(gpt_response, prompt=""): 
-    try: 
-      gpt_response = __func_clean_up(gpt_response, prompt="")
-      if len(gpt_response) != 2: 
+  def __func_validate(gpt_response, prompt=""):
+    try:
+      cr = __func_clean_up(gpt_response, prompt="")
+      if len(cr) != 2 or not cr[0] or not cr[1]:
         return False
     except: return False
-    return True 
+    return True
 
-  def get_fail_safe(persona): 
+  def get_fail_safe(persona):
     fs = (persona.name, "is", "idle")
     return fs
 
 
-  # ChatGPT Plugin ===========================================================
-  # def __chat_func_clean_up(gpt_response, prompt=""): ############
-  #   cr = gpt_response.strip()
-  #   cr = [i.strip() for i in cr.split(")")[0].split(",")]
-  #   return cr
-
-  # def __chat_func_validate(gpt_response, prompt=""): ############
-  #   try: 
-  #     gpt_response = __func_clean_up(gpt_response, prompt="")
-  #     if len(gpt_response) != 2: 
-  #       return False
-  #   except: return False
-  #   return True 
-
-  # print ("asdhfapsh8p9hfaiafdsi;ldfj as DEBUG 5") ########
-  # gpt_param = {"engine": "text-davinci-002", "max_tokens": 15, 
-  #              "temperature": 0, "top_p": 1, "stream": False,
-  #              "frequency_penalty": 0, "presence_penalty": 0, "stop": None}
-  # prompt_template = "persona/prompt_template/v3_ChatGPT/generate_event_triple_v1.txt" ########
-  # prompt_input = create_prompt_input(action_description, persona)  ########
-  # prompt = generate_prompt(prompt_input, prompt_template)
-  # example_output = "(Jane Doe, cooking, breakfast)" ########
-  # special_instruction = "The value for the output must ONLY contain the triple. If there is an incomplete element, just say 'None' but there needs to be three elements no matter what." ########
-  # fail_safe = get_fail_safe(persona) ########
-  # output = ChatGPT_safe_generate_response(prompt, example_output, special_instruction, 3, fail_safe,
-  #                                         __chat_func_validate, __chat_func_clean_up, True)
-  # if output != False: 
-  #   return output, [output, prompt, gpt_param, prompt_input, fail_safe]
-  # ChatGPT Plugin ===========================================================
-
-
-
-
-  gpt_param = {"engine": "text-davinci-003", "max_tokens": 30, 
+  gpt_param = {"engine": "text-davinci-003", "max_tokens": 30,
                "temperature": 0, "top_p": 1, "stream": False,
                "frequency_penalty": 0, "presence_penalty": 0, "stop": ["\n"]}
   prompt_template = "persona/prompt_template/v2/generate_event_triple_v1.txt"
@@ -1012,13 +1031,14 @@ def run_gpt_prompt_act_obj_desc(act_game_object, act_desp, persona, verbose=Fals
   fail_safe = get_fail_safe(act_game_object) ########
   output = ChatGPT_safe_generate_response(prompt, example_output, special_instruction, 3, fail_safe,
                                           __chat_func_validate, __chat_func_clean_up, True)
-  if output != False: 
+  if output != False:
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
 
+  output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
 
-
-  # gpt_param = {"engine": "text-davinci-003", "max_tokens": 30, 
+  # gpt_param = {"engine": "text-davinci-003", "max_tokens": 30,
   #              "temperature": 0, "top_p": 1, "stream": False,
   #              "frequency_penalty": 0, "presence_penalty": 0, "stop": ["\n"]}
   # prompt_template = "persona/prompt_template/v2/generate_obj_event_v1.txt"
@@ -1641,6 +1661,9 @@ def run_gpt_prompt_summarize_conversation(persona, conversation, test_input=None
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
 
+  output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
+
 
   # gpt_param = {"engine": "text-davinci-003", "max_tokens": 50, 
   #              "temperature": 0, "top_p": 1, "stream": False,
@@ -1894,6 +1917,9 @@ def run_gpt_prompt_event_poignancy(persona, event_description, test_input=None, 
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
 
+  output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
+
 
 
 
@@ -1964,6 +1990,9 @@ def run_gpt_prompt_thought_poignancy(persona, event_description, test_input=None
   if output != False: 
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
+
+  output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
 
 
 
@@ -2036,6 +2065,9 @@ def run_gpt_prompt_chat_poignancy(persona, event_description, test_input=None, v
   if output != False: 
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
+
+  output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
 
 
 
@@ -2240,6 +2272,9 @@ def run_gpt_prompt_agent_chat_summarize_ideas(persona, target_persona, statement
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
 
+  output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
+
 
 
   # gpt_param = {"engine": "text-davinci-003", "max_tokens": 150, 
@@ -2307,6 +2342,9 @@ def run_gpt_prompt_agent_chat_summarize_relationship(persona, target_persona, st
   if output != False: 
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
+
+  output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
 
 
   # gpt_param = {"engine": "text-davinci-003", "max_tokens": 150, 
@@ -2437,6 +2475,9 @@ def run_gpt_prompt_agent_chat(maze, persona, target_persona,
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
 
+  output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
+
 
 
 
@@ -2516,6 +2557,9 @@ def run_gpt_prompt_summarize_ideas(persona, statements, question, test_input=Non
   if output != False: 
     return output, [output, prompt, gpt_param, prompt_input, fail_safe]
   # ChatGPT Plugin ===========================================================
+
+  output = fail_safe
+  return output, [output, prompt, gpt_param, prompt_input, fail_safe]
 
 
   # gpt_param = {"engine": "text-davinci-003", "max_tokens": 150, 

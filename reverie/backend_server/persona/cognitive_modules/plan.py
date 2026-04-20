@@ -479,7 +479,7 @@ def _long_term_planning(persona, new_day):
     # if this is the start of generation (so there is no previous day's 
     # daily requirement, or if we are on a new day, we want to create a new
     # set of daily requirements.
-    persona.scratch.daily_req = generate_first_daily_plan(persona, 
+    persona.scratch.daily_req = generate_first_daily_plan(persona,
                                                           wake_up_hour)
   elif new_day == "New day":
     revise_identity(persona)
@@ -491,7 +491,7 @@ def _long_term_planning(persona, new_day):
   # Based on the daily_req, we create an hourly schedule for the persona, 
   # which is a list of todo items with a time duration (in minutes) that 
   # add up to 24 hours.
-  persona.scratch.f_daily_schedule = generate_hourly_schedule(persona, 
+  persona.scratch.f_daily_schedule = generate_hourly_schedule(persona,
                                                               wake_up_hour)
   persona.scratch.f_daily_schedule_hourly_org = (persona.scratch
                                                    .f_daily_schedule[:])
@@ -615,9 +615,20 @@ def _determine_action(persona, maze):
 
 
 
-  act_desp, act_dura = persona.scratch.f_daily_schedule[curr_index] 
+  act_desp, act_dura = persona.scratch.f_daily_schedule[curr_index]
 
-
+  # Adjust duration for the current task: subtract time already elapsed.
+  # e.g., if sleeping is 420 min (0:00-7:00) but sim starts at 6:00,
+  # the remaining duration should be 60 min, not 420.
+  elapsed_min = (persona.scratch.curr_time.hour * 60
+                 + persona.scratch.curr_time.minute)
+  prior_min = sum(persona.scratch.f_daily_schedule[i][1]
+                  for i in range(curr_index))
+  remaining = prior_min + act_dura - elapsed_min
+  if 0 < remaining < act_dura:
+    print(f"  [DEBUG] Adjusted {persona.scratch.name}'s '{act_desp}' "
+          f"duration from {act_dura} to {remaining} min", flush=True)
+    act_dura = remaining
 
   # Finding the target location of the action and creating action-related
   # variables.
